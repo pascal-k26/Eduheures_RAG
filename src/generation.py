@@ -16,7 +16,7 @@ from src.web_search import (
 
 logger = logging.getLogger(__name__)
 
-#  Caches singletons 
+#  Caches singletons
 _prompt_cache = None
 _base_cache   = None
 
@@ -54,7 +54,7 @@ def construire_messages(prompt_systeme: str, historique: list, contenu_utilisate
     return messages
 
 
-# Passes de génération 
+# Passes de génération
 
 def premiere_passe(question: str, historique: list) -> str:
     """Le LLM décide s'il faut chercher dans Qdrant et/ou sur le web."""
@@ -109,10 +109,9 @@ def deuxieme_passe(
     return resultat.content
 
 
-# Filtrage des sources citées 
+# Filtrage des sources citées
 
 def _filtrer_sources_citees(sources: list, reponse: str, cle: str = "nom_court") -> list:
-   
     citees = []
     reponse_lower = reponse.lower()
     for source in sources:
@@ -123,10 +122,10 @@ def _filtrer_sources_citees(sources: list, reponse: str, cle: str = "nom_court")
     return citees
 
 
-# Orchestrateur principal 
+# Orchestrateur principal
 
 def repondre(question: str, historique: list = None) -> dict:
-    
+
     if historique is None:
         historique = []
 
@@ -143,7 +142,7 @@ def repondre(question: str, historique: list = None) -> dict:
         base = None
         base_disponible = False
 
-    # Étape 1 : première passe 
+    # Étape 1 : première passe
     reponse_brute = premiere_passe(question, historique)
 
     query_qdrant, reponse_temp   = extraire_signal_recherche(reponse_brute)
@@ -184,17 +183,34 @@ def repondre(question: str, historique: list = None) -> dict:
         except Exception as e:
             logger.error(f"Erreur recherche Qdrant : {e}")
 
-    #  Étape 3 : recherche web 
+    # Étape 3 : recherche web
+    # Détection si la première passe indique une absence d'info (sans avoir cherché)
+    PHRASES_ABSENCE_INFO = (
+        "je n'ai pas cette information",
+        "je n'ai pas d'information",
+        "pas dans ma base",
+        "contactez directement",
+        "je ne dispose pas",
+        "information non disponible",
+    )
+    reponse_indique_absence = any(
+        phrase in reponse_finale.lower() for phrase in PHRASES_ABSENCE_INFO
+    )
+
     doit_chercher_web = (
         bool(query_web)
         or (query_qdrant and not documents_qdrant)
         or question_porte_sur_actualite
+        or reponse_indique_absence  # fallback : le LLM dit qu'il ne sait pas → on cherche
     )
 
     if doit_chercher_web:
         query_web_effective = query_web or query_qdrant or question
         if question_porte_sur_actualite and "2026" not in query_web_effective:
             query_web_effective = f"{query_web_effective} 2026"
+        # Si fallback absence sans query construite : utiliser la question brute avec contexte UVCI
+        if reponse_indique_absence and not query_web and not query_qdrant:
+            query_web_effective = f"{question} UVCI Côte d'Ivoire"
         try:
             resultats_web = rechercher_sur_le_web(
                 query=query_web_effective,
@@ -206,7 +222,7 @@ def repondre(question: str, historique: list = None) -> dict:
             logger.error(f"Erreur recherche web : {e}")
             resultats_web = []
 
-    #  Étape 4 : deuxième passe 
+    # Étape 4 : deuxième passe
     if documents_qdrant or resultats_web:
         try:
             reponse_finale = deuxieme_passe(question, documents_qdrant, resultats_web, historique)
@@ -216,7 +232,7 @@ def repondre(question: str, historique: list = None) -> dict:
     # Nettoyage des signaux résiduels
     reponse_finale = re.sub(r"\[RECHERCHE[^\]]*\]", "", reponse_finale, flags=re.IGNORECASE).strip()
 
-    # Étape 5 : filtrage des sources réellement citées ─────────────────────
+    # Étape 5 : filtrage des sources réellement citées
     sources_qdrant_filtrees = _filtrer_sources_citees(sources_qdrant, reponse_finale, cle="nom_court")
 
     sources_web_filtrees = [
@@ -247,7 +263,7 @@ def repondre(question: str, historique: list = None) -> dict:
     }
 
 
-# Prompt de secours 
+# Prompt de secours
 
 def _prompt_par_defaut() -> str:
     return """Tu es Eduheures, l'assistant virtuel de l'Université Virtuelle de Côte d'Ivoire (UVCI).
