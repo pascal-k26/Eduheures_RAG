@@ -58,7 +58,7 @@ ALLOWED_ORIGINS: list[str] = (
     else [
         "http://localhost:5500",
         "http://127.0.0.1:5500",
-        "https://eduheures.up.railway.app",   # à adapter 
+        "https://eduheure.up.railway.app",   # à adapter 
     ]
 )
 
