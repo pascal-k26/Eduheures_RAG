@@ -33,7 +33,7 @@ def creer_modele_chat():
 
         if _est_modele_reasoning(AZURE_CHAT_DEPLOYMENT):
             # gpt-5*, o1, o3, o4* : temperature interdite (sauf valeur par defaut 1
-            kwargs["reasoning_effort"] = AZURE_CHAT_REASONING_EFFORT)
+            kwargs["reasoning_effort"] = AZURE_CHAT_REASONING_EFFORT
         else:
             temperature = os.getenv("AZURE_CHAT_TEMPERATURE")
             if temperature is not None and temperature != "":
