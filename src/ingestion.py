@@ -1,187 +1,194 @@
 import os
-import json
+import re
 import time
+import uuid
+import hashlib
 import logging
-from datetime import datetime
+from datetime import date
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import (
+    Distance, VectorParams, SparseVectorParams, PointStruct,
+    Filter, FieldCondition, MatchValue, PayloadSchemaType,
+)
+import tiktoken
 
 from src.config import (
-    DOSSIER_DONNEES_BRUTES,
-    DOSSIER_DONNEES_TRAITEES,
-    TAILLE_CHUNK,
-    CHEVAUCHEMENT_CHUNK,
-    QDRANT_URL,
-    QDRANT_API_KEY,
-    QDRANT_COLLECTION,
+    DOSSIER_DONNEES_BRUTES, QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION,
+    NOM_VECTEUR_DENSE, NOM_VECTEUR_SPARSE,
+    TAILLE_CHUNK_TOKENS, CHEVAUCHEMENT_CHUNK_TOKENS,
 )
 from src.utils import creer_modele_embedding
+from src.qdrant_wrapper import creer_modele_sparse
 
 logger = logging.getLogger(__name__)
 
+_encodeur = tiktoken.get_encoding("cl100k_base")
 
-# Nettoyage du texte
+
+def _compter_tokens(texte: str) -> int:
+    return len(_encodeur.encode(texte))
+
 
 def nettoyer_texte(texte: str) -> str:
-    import re
     texte = re.sub(r"[\x80-\xff]{3,}", "", texte)
     texte = re.sub(r" {2,}", " ", texte)
     texte = re.sub(r"\n\n\n+", "\n\n", texte)
-    lines = [l.strip() for l in texte.split("\n") if l.strip() and not re.match(r"^[.\-]+$", l.strip())]
-    return "\n".join(lines).strip()
+    lignes = [l.strip() for l in texte.split("\n") if l.strip() and not re.match(r"^[.\-]+$", l.strip())]
+    return "\n".join(lignes).strip()
 
 
-# Chargement des documents
-
-def charger_documents(dossier: str) -> list:
-    if not os.path.exists(dossier):
-        raise FileNotFoundError(f"Dossier introuvable : {dossier}")
-
-    documents = []
-    fichiers_pdf = [f for f in os.listdir(dossier) if f.endswith(".pdf")]
-
-    if not fichiers_pdf:
-        raise FileNotFoundError(f"Aucun fichier PDF trouvé dans {dossier}.")
-
-    print(f"  {len(fichiers_pdf)} fichier(s) PDF trouvé(s)")
-
-    for i, fichier in enumerate(fichiers_pdf, 1):
-        chemin = os.path.join(dossier, fichier)
-        try:
-            print(f"  [{i}/{len(fichiers_pdf)}] Chargement : {fichier}...", end=" ")
-            loader = PyPDFLoader(chemin)
-            docs = loader.load()
-            for doc in docs:
-                doc.page_content = nettoyer_texte(doc.page_content)
-                # Ajouter métadonnées UVCI
-                doc.metadata["universite"] = "UVCI"
-                doc.metadata["categorie"]  = _detecter_categorie(fichier)
-            documents.extend(docs)
-            print(f"✓ ({len(docs)} pages)")
-        except Exception as e:
-            print(f"ERREUR : {e}")
-            continue
-
-    if not documents:
-        raise FileNotFoundError("Aucun document valide chargé.")
-
-    print(f"\n  Total : {len(documents)} page(s) chargée(s).")
-    return documents
-
-
-def _detecter_categorie(nom_fichier: str) -> str:
-    """Détecte la catégorie du document UVCI à partir du nom de fichier."""
-    nom = nom_fichier.lower()
-    if any(k in nom for k in ["inscription", "admission", "candidature"]):
+def _detecter_categorie(nom_fichier: str, texte: str) -> str:
+    # regarde le nom du fichier et le debut du contenu, pas seulement le nom
+    cible = (nom_fichier + " " + texte[:300]).lower()
+    if any(k in cible for k in ["inscription", "admission", "candidature"]):
         return "inscription"
-    if any(k in nom for k in ["programme", "formation", "licence", "master", "bts"]):
+    if any(k in cible for k in ["programme", "formation", "licence", "master", "bts"]):
         return "formation"
-    if any(k in nom for k in ["calendrier", "planning", "examen"]):
+    if any(k in cible for k in ["calendrier", "planning", "examen"]):
         return "calendrier"
-    if any(k in nom for k in ["frais", "scolarite", "tarif", "bourse"]):
+    if any(k in cible for k in ["frais", "scolarite", "tarif", "bourse"]):
         return "frais"
-    if any(k in nom for k in ["contact", "service", "administration"]):
+    if any(k in cible for k in ["contact", "service", "administration"]):
         return "contact"
     return "general"
 
 
-# Découpage
+def charger_documents(dossier: str) -> list:
+    if not os.path.exists(dossier):
+        raise FileNotFoundError(f"dossier introuvable: {dossier}")
+
+    fichiers_pdf = [f for f in os.listdir(dossier) if f.endswith(".pdf")]
+    if not fichiers_pdf:
+        raise FileNotFoundError(f"aucun pdf trouve dans {dossier}")
+
+    documents = []
+    for fichier in fichiers_pdf:
+        chemin = os.path.join(dossier, fichier)
+        try:
+            docs = PyPDFLoader(chemin).load()
+            for doc in docs:
+                doc.page_content = nettoyer_texte(doc.page_content)
+                doc.metadata["categorie"] = _detecter_categorie(fichier, doc.page_content)
+            documents.extend(docs)
+            print(f"charge: {fichier} ({len(docs)} pages)")
+        except Exception as e:
+            print(f"erreur sur {fichier}: {e}")
+
+    if not documents:
+        raise FileNotFoundError("aucun document valide charge")
+    return documents
+
 
 def decouper_documents(documents: list) -> list:
     decoupeur = RecursiveCharacterTextSplitter(
-        chunk_size=TAILLE_CHUNK,
-        chunk_overlap=CHEVAUCHEMENT_CHUNK,
+        chunk_size=TAILLE_CHUNK_TOKENS,
+        chunk_overlap=CHEVAUCHEMENT_CHUNK_TOKENS,
+        length_function=_compter_tokens,
         separators=["\n\n", "\n", ".", " ", ""],
     )
     morceaux = decoupeur.split_documents(documents)
-    print(f"  {len(morceaux)} chunk(s) créé(s).")
+
+    # numerote les chunks dans l'ordre par fichier source
+    compteurs = {}
+    for m in morceaux:
+        source = m.metadata.get("source", "inconnu")
+        compteurs[source] = compteurs.get(source, -1) + 1
+        m.metadata["chunk_index"] = compteurs[source]
+
+    print(f"{len(morceaux)} chunks crees")
     return morceaux
 
 
-# Ingestion Qdrant
-
-def ingerer_dans_qdrant(morceaux: list) -> None:
-    """Indexe les chunks dans Qdrant Cloud."""
-    if not QDRANT_URL or not QDRANT_API_KEY:
-        raise EnvironmentError("QDRANT_URL et QDRANT_API_KEY sont requis dans .env")
-
-    modele_embedding = creer_modele_embedding()
-    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
-
-    # Vérification de la dimension d'embedding
-    test_vec = modele_embedding.embed_query("test")
-    dim = len(test_vec)
-    print(f"\n  Dimension d'embedding : {dim}")
-
-    # Création ou vérification de la collection
-    collections_existantes = [c.name for c in client.get_collections().collections]
-    if QDRANT_COLLECTION not in collections_existantes:
-        print(f"  Création de la collection '{QDRANT_COLLECTION}'...")
+def _assurer_collection(client: QdrantClient, dim: int):
+    collections = [c.name for c in client.get_collections().collections]
+    if QDRANT_COLLECTION not in collections:
         client.create_collection(
             collection_name=QDRANT_COLLECTION,
-            vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+            vectors_config={NOM_VECTEUR_DENSE: VectorParams(size=dim, distance=Distance.COSINE)},
+            sparse_vectors_config={NOM_VECTEUR_SPARSE: SparseVectorParams()},
         )
-        print(f"  Collection créée.")
-    else:
-        print(f"  Collection '{QDRANT_COLLECTION}' existante — ajout des documents.")
+        print(f"collection '{QDRANT_COLLECTION}' creee")
 
-    # Indexation par batch
+    client.create_payload_index(QDRANT_COLLECTION, "metadata.source", PayloadSchemaType.KEYWORD)
+    client.create_payload_index(QDRANT_COLLECTION, "metadata.categorie", PayloadSchemaType.KEYWORD)
+
+
+def _supprimer_anciens_points(client: QdrantClient, sources: set):
+    # supprime les points existants d'un fichier avant de le reindexer
+    for source in sources:
+        client.delete(
+            collection_name=QDRANT_COLLECTION,
+            points_selector=Filter(must=[FieldCondition(key="metadata.source", match=MatchValue(value=source))]),
+        )
+
+
+def ingerer_dans_qdrant(morceaux: list) -> None:
+    if not QDRANT_URL or not QDRANT_API_KEY:
+        raise EnvironmentError("QDRANT_URL et QDRANT_API_KEY requis dans .env")
+
+    modele_dense = creer_modele_embedding()
+    modele_sparse = creer_modele_sparse()
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
+
+    dim = len(modele_dense.embed_query("test"))
+    _assurer_collection(client, dim)
+
+    sources = {m.metadata.get("source", "inconnu") for m in morceaux}
+    _supprimer_anciens_points(client, sources)
+
+    aujourdhui = date.today().isoformat()
     taille_batch = 10
     total_batches = (len(morceaux) + taille_batch - 1) // taille_batch
-    print(f"\n  Indexation de {len(morceaux)} chunks en {total_batches} batch(es)...")
 
     for i in range(0, len(morceaux), taille_batch):
-        batch = morceaux[i : i + taille_batch]
-        batch_num = i // taille_batch + 1
-
+        batch = morceaux[i:i + taille_batch]
         textes = [m.page_content for m in batch]
-        vecteurs = modele_embedding.embed_documents(textes)
 
-        points = [
-            PointStruct(
-                id=i + j,
-                vector=vecteur,
-                payload={
-                    "page_content": batch[j].page_content,
-                    "metadata": {
-                        "source":     batch[j].metadata.get("source", "Inconnu"),
-                        "page":       batch[j].metadata.get("page", 0),
-                        "universite": batch[j].metadata.get("universite", "UVCI"),
-                        "categorie":  batch[j].metadata.get("categorie", "general"),
+        vecteurs_denses = modele_dense.embed_documents(textes)
+        vecteurs_sparses = list(modele_sparse.embed(textes))
+
+        points = []
+        for m, v_dense, v_sparse in zip(batch, vecteurs_denses, vecteurs_sparses):
+            hash_contenu = hashlib.sha256(m.page_content.encode("utf-8")).hexdigest()[:16]
+            points.append(PointStruct(
+                id=str(uuid.uuid4()),
+                vector={
+                    NOM_VECTEUR_DENSE: v_dense,
+                    NOM_VECTEUR_SPARSE: {
+                        "indices": v_sparse.indices.tolist(),
+                        "values": v_sparse.values.tolist(),
                     },
                 },
-            )
-            for j, vecteur in enumerate(vecteurs)
-        ]
+                payload={
+                    "page_content": m.page_content,
+                    "metadata": {
+                        "source": m.metadata.get("source", "inconnu"),
+                        "page": m.metadata.get("page", 0),
+                        "categorie": m.metadata.get("categorie", "general"),
+                        "chunk_index": m.metadata.get("chunk_index", 0),
+                        "date_ingestion": aujourdhui,
+                        "hash_contenu": hash_contenu,
+                    },
+                },
+            ))
 
         client.upsert(collection_name=QDRANT_COLLECTION, points=points)
-        print(f"  [{batch_num}/{total_batches}] {len(points)} point(s) indexé(s)")
-        time.sleep(0.2)  # Respect du rate limit Qdrant Cloud
+        print(f"batch {i // taille_batch + 1}/{total_batches} indexe")
+        time.sleep(0.2)
 
     info = client.get_collection(QDRANT_COLLECTION)
-    print(f"\n  ✓ Indexation terminée — {info.points_count} vecteurs dans '{QDRANT_COLLECTION}'")
+    print(f"indexation terminee, {info.points_count} points dans '{QDRANT_COLLECTION}'")
 
 
-#  Point d'entrée 
 def executer_ingestion():
-    """Lance l'ingestion complète des documents UVCI vers Qdrant."""
-    print("=" * 60)
-    print("  EDUHEURES — Ingestion des documents UVCI vers Qdrant")
-    print("=" * 60)
-
-    print(f"\n[1/3] Chargement des PDF depuis '{DOSSIER_DONNEES_BRUTES}'...")
+    print("ingestion uvci vers qdrant")
     documents = charger_documents(DOSSIER_DONNEES_BRUTES)
-
-    print(f"\n[2/3] Découpage des documents...")
     morceaux = decouper_documents(documents)
-
-    print(f"\n[3/3] Indexation dans Qdrant Cloud...")
     ingerer_dans_qdrant(morceaux)
-
-    print("\n✓ Ingestion terminée avec succès !")
+    print("ingestion terminee")
 
 
 if __name__ == "__main__":
